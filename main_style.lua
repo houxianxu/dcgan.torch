@@ -1,24 +1,22 @@
 require 'torch'
 require 'nn'
-require 'optim'
 require 'cunn'
 require 'cudnn'
-require 'loadcaffe'
-
-
+require 'optim'
+require 'style_vgg'
 util = paths.dofile('util.lua')
 
 opt = {
    dataset = 'lsun',       -- imagenet / lsun / folder
-   batchSize = 20,
+   batchSize = 32,
    loadSize = 64,
    fineSize = 64,
    nz = 100,               -- #  of dim for Z
-   ngf = 64,               -- #  of gen filters in first conv layer
-   ndf = 64,               -- #  of discrim filters in first conv layer
+   ngf = 32,               -- #  of gen filters in first conv layer
+   ndf = 32,               -- #  of discrim filters in first conv layer
    nThreads = 4,           -- #  of data loading threads to use
    niter = 25,             -- #  of iter at starting learning rate
-   lr = 0.0002,            -- initial learning rate for adam
+   lr = 0.00002,            -- initial learning rate for adam
    beta1 = 0.5,            -- momentum term of adam
    ntrain = math.huge,     -- #  of examples per epoch. math.huge for full dataset
    display = 1,            -- display samples while training. 0 = false
@@ -26,6 +24,12 @@ opt = {
    gpu = 1,                -- gpu = 0 is CPU mode. gpu=X is GPU mode on GPU X
    name = 'experiment1',
    noise = 'normal',       -- uniform / normal
+
+   -- add vgg info
+  proto_file = 'model/VGG_ILSVRC_19_layers_deploy.prototxt',
+  model_file = 'model/VGG_ILSVRC_19_layers.caffemodel',
+  style_layer = 'conv1_1',
+  backend = 'cudnn',
 }
 
 -- one-line argument parser. parses enviroment variables to override the defaults
@@ -45,7 +49,16 @@ local data = DataLoader.new(opt.nThreads, opt.dataset, opt)
 print("Dataset: " .. opt.dataset, " Size: ", data:size())
 ----------------------------------------------------------------------------
 
-local function scale_batch(imgs, size1, size2)
+
+-- load style vgg
+print('load style_net')
+local style_net = create_style_vgg(opt.style_layer, opt.proto_file, opt.model_file, opt.backend)
+local test_image = torch.randn(2, 3, 64, 64):cuda()
+local test_result = style_net:forward(test_image)
+local nc = test_result:size(2)
+
+
+local function resize_image_batch(imgs, size1, size2)
   local output_imgs = torch.Tensor(imgs:size(1), imgs:size(2), size1, size2)
   for i = 1, imgs:size(1) do
     output_imgs[i] = image.scale(imgs[i], size1, size2)
@@ -63,6 +76,7 @@ local function weights_init(m)
       if m.bias then m.bias:fill(0) end
    end
 end
+
 
 local nc = 3
 local nz = opt.nz
@@ -90,8 +104,6 @@ netG:add(SpatialFullConvolution(ngf * 2, ngf, 4, 4, 2, 2, 1, 1))
 netG:add(SpatialBatchNormalization(ngf)):add(nn.ReLU(true))
 -- state size: (ngf) x 32 x 32
 netG:add(SpatialFullConvolution(ngf, nc, 4, 4, 2, 2, 1, 1))
--- netG:add(SpatialBatchNormalization(nc)):add(nn.ReLU(true))
--- netG:add(SpatialConvolution(nc, nc, 3, 3, 1, 1, 1, 1))
 netG:add(nn.Tanh())
 -- state size: (nc) x 64 x 64
 
@@ -100,7 +112,7 @@ netG:apply(weights_init)
 local netD = nn.Sequential()
 
 -- input is (nc) x 64 x 64
-netD:add(SpatialConvolution(nc, ndf, 4, 4, 2, 2, 1, 1))
+netD:add(SpatialConvolution(1, ndf, 4, 4, 2, 2, 1, 1))
 netD:add(nn.LeakyReLU(0.2, true))
 -- state size: (ndf) x 32 x 32
 netD:add(SpatialConvolution(ndf, ndf * 2, 4, 4, 2, 2, 1, 1))
@@ -120,33 +132,10 @@ netD:add(nn.View(1):setNumInputDims(3))
 
 netD:apply(weights_init)
 
--- local vgg = loadcaffe.load('model/VGG_ILSVRC_19_layers_deploy.prototxt', 'model/VGG_ILSVRC_19_layers.caffemodel', 'cudnn')
-
--- -- for i = 1, 9 do
--- --   vgg:remove()
--- -- end
--- vgg:remove(39)
--- vgg:insert(nn.Linear(2048, 4096), 39)
--- vgg:remove()
--- vgg:remove()
--- vgg:add(nn.Linear(4096, 1))
--- vgg:add(nn.Sigmoid())
--- vgg:add(nn.Squeeze())
-
--- test = torch.randn(2, 3, 64, 64)
-
--- vgg = vgg:cuda()
--- print(vgg:forward(test:cuda()):size())
-
-
--- netD = vgg
-
--- print(netD)
-
 local criterion = nn.BCECriterion()
 ---------------------------------------------------------------------------
 optimStateG = {
-   learningRate = opt.lr,
+   learningRate = opt.lr * 100,
    beta1 = opt.beta1,
 }
 optimStateD = {
@@ -182,10 +171,6 @@ elseif opt.noise == 'normal' then
     noise_vis:normal(0, 1)
 end
 
-local style_image = image.load('style_image.jpg', 3)
-local style_image = image.scale(style_image, 64, 64)
-local style_image_batch = torch.repeatTensor(style_image, opt.batchSize, 1, 1, 1)
-
 -- create closure to evaluate f(X) and df/dX of discriminator
 local fDx = function(x)
    netD:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
@@ -195,17 +180,19 @@ local fDx = function(x)
 
    -- train with real
    data_tm:reset(); data_tm:resume()
-   -- local real = data:getBatch()
-   real = style_image_batch
+   local real = data:getBatch()
    data_tm:stop()
    input:copy(real)
+   input_feature = style_net:forward(input):clone()
+   input_feature_size = input_feature:size(3)
+   input_feature = resize_image_batch(input_feature:float(), opt.fineSize, opt.fineSize)
+   input_feature = input_feature:cuda()
    label:fill(real_label)
 
-
-   local output = netD:forward(input)
+   local output = netD:forward(input_feature)
    local errD_real = criterion:forward(output, label)
    local df_do = criterion:backward(output, label)
-   netD:backward(input, df_do)
+   netD:backward(input_feature, df_do)
 
    -- train with fake
    if opt.noise == 'uniform' then -- regenerate random noise
@@ -215,14 +202,15 @@ local fDx = function(x)
    end
    local fake = netG:forward(noise)
    input:copy(fake)
+   input_feature = style_net:forward(input):clone()
+   input_feature = resize_image_batch(input_feature:float(), opt.fineSize, opt.fineSize)
+   input_feature = input_feature:cuda()
    label:fill(fake_label)
 
-
-
-   local output = netD:forward(input)
+   local output = netD:forward(input_feature)
    local errD_fake = criterion:forward(output, label)
    local df_do = criterion:backward(output, label)
-   netD:backward(input, df_do)
+   netD:backward(input_feature, df_do)
 
    errD = errD_real + errD_fake
 
@@ -245,7 +233,9 @@ local fGx = function(x)
    local output = netD.output -- netD:forward(input) was already executed in fDx, so save computation
    errG = criterion:forward(output, label)
    local df_do = criterion:backward(output, label)
-   local df_dg = netD:updateGradInput(input, df_do)
+   local df_dg_feature = netD:updateGradInput(input_feature, df_do)
+   df_dg_feature = resize_image_batch(df_dg_feature:float(), input_feature_size, input_feature_size):cuda()
+   local df_dg = style_net:updateGradInput(input, df_dg_feature)
 
    netG:backward(noise, df_dg)
    return errG, gradParametersG
@@ -266,7 +256,8 @@ for epoch = 1, opt.niter do
       -- display
       counter = counter + 1
       if counter % 10 == 0 and opt.display then
-          local fake = netG:forward(noise_vis)
+          local fake = netG:forward(noise_vis):double()
+          local real = data:getBatch()
           disp.image(fake, {win=opt.display_id, title=opt.name})
           disp.image(real, {win=opt.display_id * 3, title=opt.name})
       end

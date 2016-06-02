@@ -10,7 +10,7 @@ util = paths.dofile('util.lua')
 
 opt = {
    dataset = 'lsun',       -- imagenet / lsun / folder
-   batchSize = 20,
+   batchSize = 64,
    loadSize = 64,
    fineSize = 64,
    nz = 100,               -- #  of dim for Z
@@ -18,7 +18,7 @@ opt = {
    ndf = 64,               -- #  of discrim filters in first conv layer
    nThreads = 4,           -- #  of data loading threads to use
    niter = 25,             -- #  of iter at starting learning rate
-   lr = 0.0002,            -- initial learning rate for adam
+   lr = 0.002,            -- initial learning rate for adam
    beta1 = 0.5,            -- momentum term of adam
    ntrain = math.huge,     -- #  of examples per epoch. math.huge for full dataset
    display = 1,            -- display samples while training. 0 = false
@@ -75,27 +75,32 @@ local SpatialBatchNormalization = nn.SpatialBatchNormalization
 local SpatialConvolution = nn.SpatialConvolution
 local SpatialFullConvolution = nn.SpatialFullConvolution
 
-local netG = nn.Sequential()
--- input is Z, going into a convolution
-netG:add(SpatialFullConvolution(nz, ngf * 8, 4, 4))
-netG:add(SpatialBatchNormalization(ngf * 8)):add(nn.ReLU(true))
--- state size: (ngf*8) x 4 x 4
-netG:add(SpatialFullConvolution(ngf * 8, ngf * 4, 4, 4, 2, 2, 1, 1))
-netG:add(SpatialBatchNormalization(ngf * 4)):add(nn.ReLU(true))
--- state size: (ngf*4) x 8 x 8
-netG:add(SpatialFullConvolution(ngf * 4, ngf * 2, 4, 4, 2, 2, 1, 1))
-netG:add(SpatialBatchNormalization(ngf * 2)):add(nn.ReLU(true))
--- state size: (ngf*2) x 16 x 16
-netG:add(SpatialFullConvolution(ngf * 2, ngf, 4, 4, 2, 2, 1, 1))
-netG:add(SpatialBatchNormalization(ngf)):add(nn.ReLU(true))
--- state size: (ngf) x 32 x 32
-netG:add(SpatialFullConvolution(ngf, nc, 4, 4, 2, 2, 1, 1))
--- netG:add(SpatialBatchNormalization(nc)):add(nn.ReLU(true))
--- netG:add(SpatialConvolution(nc, nc, 3, 3, 1, 1, 1, 1))
-netG:add(nn.Tanh())
--- state size: (nc) x 64 x 64
+-- local netG = nn.Sequential()
+-- -- input is Z, going into a convolution
+-- netG:add(SpatialFullConvolution(nz, ngf * 8, 4, 4))
+-- netG:add(SpatialBatchNormalization(ngf * 8)):add(nn.ReLU(true))
+-- -- state size: (ngf*8) x 4 x 4
+-- netG:add(SpatialFullConvolution(ngf * 8, ngf * 4, 4, 4, 2, 2, 1, 1))
+-- netG:add(SpatialBatchNormalization(ngf * 4)):add(nn.ReLU(true))
+-- -- state size: (ngf*4) x 8 x 8
+-- netG:add(SpatialFullConvolution(ngf * 4, ngf * 2, 4, 4, 2, 2, 1, 1))
+-- netG:add(SpatialBatchNormalization(ngf * 2)):add(nn.ReLU(true))
+-- -- state size: (ngf*2) x 16 x 16
+-- netG:add(SpatialFullConvolution(ngf * 2, ngf, 4, 4, 2, 2, 1, 1))
+-- netG:add(SpatialBatchNormalization(ngf)):add(nn.ReLU(true))
+-- -- state size: (ngf) x 32 x 32
+-- netG:add(SpatialFullConvolution(ngf, nc, 4, 4, 2, 2, 1, 1))
+-- -- netG:add(SpatialBatchNormalization(nc)):add(nn.ReLU(true))
+-- -- netG:add(SpatialConvolution(nc, nc, 3, 3, 1, 1, 1, 1))
+-- netG:add(nn.Tanh())
+-- -- state size: (nc) x 64 x 64
 
+
+
+local netG = require('pyramid')
 netG:apply(weights_init)
+
+print(netG)
 
 local netD = nn.Sequential()
 
@@ -120,28 +125,7 @@ netD:add(nn.View(1):setNumInputDims(3))
 
 netD:apply(weights_init)
 
--- local vgg = loadcaffe.load('model/VGG_ILSVRC_19_layers_deploy.prototxt', 'model/VGG_ILSVRC_19_layers.caffemodel', 'cudnn')
 
--- -- for i = 1, 9 do
--- --   vgg:remove()
--- -- end
--- vgg:remove(39)
--- vgg:insert(nn.Linear(2048, 4096), 39)
--- vgg:remove()
--- vgg:remove()
--- vgg:add(nn.Linear(4096, 1))
--- vgg:add(nn.Sigmoid())
--- vgg:add(nn.Squeeze())
-
--- test = torch.randn(2, 3, 64, 64)
-
--- vgg = vgg:cuda()
--- print(vgg:forward(test:cuda()):size())
-
-
--- netD = vgg
-
--- print(netD)
 
 local criterion = nn.BCECriterion()
 ---------------------------------------------------------------------------
@@ -155,7 +139,7 @@ optimStateD = {
 }
 ----------------------------------------------------------------------------
 local input = torch.Tensor(opt.batchSize, 3, opt.fineSize, opt.fineSize)
-local noise = torch.Tensor(opt.batchSize, nz, 1, 1)
+local noise = torch.randn(opt.batchSize, 3, 64, 64)
 local label = torch.Tensor(opt.batchSize)
 local errD, errG
 local epoch_tm = torch.Timer()
@@ -182,10 +166,14 @@ elseif opt.noise == 'normal' then
     noise_vis:normal(0, 1)
 end
 
+
 local style_image = image.load('style_image.jpg', 3)
 local style_image = image.scale(style_image, 64, 64)
-local style_image_batch = torch.repeatTensor(style_image, opt.batchSize, 1, 1, 1)
+style_image_batch = torch.repeatTensor(style_image, opt.batchSize, 1, 1, 1)
 
+
+noise_vis2 = torch.randn(opt.batchSize, 3, 64, 64):cuda()
+noise_vis = data:getBatch()
 -- create closure to evaluate f(X) and df/dX of discriminator
 local fDx = function(x)
    netD:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
@@ -195,7 +183,7 @@ local fDx = function(x)
 
    -- train with real
    data_tm:reset(); data_tm:resume()
-   -- local real = data:getBatch()
+   -- real = data:getBatch()
    real = style_image_batch
    data_tm:stop()
    input:copy(real)
@@ -208,11 +196,15 @@ local fDx = function(x)
    netD:backward(input, df_do)
 
    -- train with fake
-   if opt.noise == 'uniform' then -- regenerate random noise
-       noise:uniform(-1, 1)
-   elseif opt.noise == 'normal' then
-       noise:normal(0, 1)
-   end
+   -- if opt.noise == 'uniform' then -- regenerate random noise
+   --     noise:uniform(-1, 1)
+   -- elseif opt.noise == 'normal' then
+   --     noise:normal(0, 1)
+   -- end
+
+   -- noise = torch.randn(opt.batchSize, 3, 64, 64):mul(0.001):cuda()
+   noise = real:cuda()
+   -- noise = data:getBatch():cuda()
    local fake = netG:forward(noise)
    input:copy(fake)
    label:fill(fake_label)
@@ -266,9 +258,13 @@ for epoch = 1, opt.niter do
       -- display
       counter = counter + 1
       if counter % 10 == 0 and opt.display then
-          local fake = netG:forward(noise_vis)
+          local fake = netG:forward(noise_vis:cuda()):clone()
+          local fake2 = netG:forward(noise_vis2:cuda()):clone()
           disp.image(fake, {win=opt.display_id, title=opt.name})
+          disp.image(fake2, {win=opt.display_id * 2, title=opt.name})
           disp.image(real, {win=opt.display_id * 3, title=opt.name})
+          disp.image(noise, {win=opt.display_id * 4, title=opt.name})
+          disp.image(noise_vis, {win=opt.display_id * 5, title=opt.name})
       end
 
       -- logging

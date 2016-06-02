@@ -14,6 +14,8 @@ opt = {
     display = 1,           -- Display image: 0 = false, 1 = true
     nz = 100,              
 }
+
+torch.manualSeed(0)
 for k,v in pairs(opt) do opt[k] = tonumber(os.getenv(k)) or os.getenv(k) or opt[k] end
 print(opt)
 if opt.display == 0 then opt.display = false end
@@ -78,7 +80,14 @@ end
 -- this drastically reduces the memory needed to generate samples
 util.optimizeInferenceMemory(net)
 
-local images = net:forward(noise)
+local images = net:forward(noise + 1)
+image.display(images)
+
+for i = 1, images:size(1) do
+    images[i] = torch.clamp(images[i], 0, 1)
+end
+
+image.display(images)
 print('Images size: ', images:size(1)..' x '..images:size(2) ..' x '..images:size(3)..' x '..images:size(4))
 images:add(1):mul(0.5)
 print('Min, Max, Mean, Stdv', images:min(), images:max(), images:mean(), images:std())

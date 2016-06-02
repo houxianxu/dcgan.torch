@@ -1,12 +1,10 @@
 require 'torch'
 require 'nn'
 require 'optim'
-require 'cunn'
-require 'cudnn'
-require 'loadcaffe'
-
-
+require 'image'
 util = paths.dofile('util.lua')
+
+require 'content_vgg'
 
 opt = {
    dataset = 'lsun',       -- imagenet / lsun / folder
@@ -26,6 +24,12 @@ opt = {
    gpu = 1,                -- gpu = 0 is CPU mode. gpu=X is GPU mode on GPU X
    name = 'experiment1',
    noise = 'normal',       -- uniform / normal
+
+   -- add vgg info
+  proto_file = 'model/VGG_ILSVRC_19_layers_deploy.prototxt',
+  model_file = 'model/VGG_ILSVRC_19_layers.caffemodel',
+  content_layer = 'conv1_2',
+  backend = 'cudnn',
 }
 
 -- one-line argument parser. parses enviroment variables to override the defaults
@@ -45,13 +49,20 @@ local data = DataLoader.new(opt.nThreads, opt.dataset, opt)
 print("Dataset: " .. opt.dataset, " Size: ", data:size())
 ----------------------------------------------------------------------------
 
-local function scale_batch(imgs, size1, size2)
+-- load content vgg
+local content_net = create_content_vgg(opt.content_layer, opt.proto_file, opt.model_file, opt.backend)
+local test_image = torch.randn(2, 3, 64, 64):cuda()
+local test_result = content_net:forward(test_image)
+local nc_D = test_result:size(2)
+
+local function resize_image_batch(imgs, size1, size2)
   local output_imgs = torch.Tensor(imgs:size(1), imgs:size(2), size1, size2)
   for i = 1, imgs:size(1) do
     output_imgs[i] = image.scale(imgs[i], size1, size2)
   end
   return output_imgs
 end
+
 
 local function weights_init(m)
    local name = torch.type(m)
@@ -90,17 +101,40 @@ netG:add(SpatialFullConvolution(ngf * 2, ngf, 4, 4, 2, 2, 1, 1))
 netG:add(SpatialBatchNormalization(ngf)):add(nn.ReLU(true))
 -- state size: (ngf) x 32 x 32
 netG:add(SpatialFullConvolution(ngf, nc, 4, 4, 2, 2, 1, 1))
--- netG:add(SpatialBatchNormalization(nc)):add(nn.ReLU(true))
--- netG:add(SpatialConvolution(nc, nc, 3, 3, 1, 1, 1, 1))
 netG:add(nn.Tanh())
 -- state size: (nc) x 64 x 64
 
 netG:apply(weights_init)
 
-local netD = nn.Sequential()
 
+-- feature discriminator
+local netD_feature = nn.Sequential()
 -- input is (nc) x 64 x 64
-netD:add(SpatialConvolution(nc, ndf, 4, 4, 2, 2, 1, 1))
+netD_feature:add(SpatialConvolution(nc_D, ndf, 4, 4, 2, 2, 1, 1))
+netD_feature:add(nn.LeakyReLU(0.2, true))
+-- state size: (ndf) x 32 x 32
+netD_feature:add(SpatialConvolution(ndf, ndf * 2, 4, 4, 2, 2, 1, 1))
+netD_feature:add(SpatialBatchNormalization(ndf * 2)):add(nn.LeakyReLU(0.2, true))
+-- state size: (ndf*2) x 16 x 16
+netD_feature:add(SpatialConvolution(ndf * 2, ndf * 4, 4, 4, 2, 2, 1, 1))
+netD_feature:add(SpatialBatchNormalization(ndf * 4)):add(nn.LeakyReLU(0.2, true))
+-- state size: (ndf*4) x 8 x 8
+netD_feature:add(SpatialConvolution(ndf * 4, ndf * 8, 4, 4, 2, 2, 1, 1))
+netD_feature:add(SpatialBatchNormalization(ndf * 8)):add(nn.LeakyReLU(0.2, true))
+-- state size: (ndf*8) x 4 x 4
+netD_feature:add(SpatialConvolution(ndf * 8, 1, 4, 4))
+netD_feature:add(nn.Sigmoid())
+-- state size: 1 x 1 x 1
+netD_feature:add(nn.View(1):setNumInputDims(3))
+-- state size: 1
+
+netD_feature:apply(weights_init)
+
+
+-- image discriminator
+local netD = nn.Sequential()
+-- input is (nc) x 64 x 64
+netD:add(SpatialConvolution(3, ndf, 4, 4, 2, 2, 1, 1))
 netD:add(nn.LeakyReLU(0.2, true))
 -- state size: (ndf) x 32 x 32
 netD:add(SpatialConvolution(ndf, ndf * 2, 4, 4, 2, 2, 1, 1))
@@ -120,32 +154,14 @@ netD:add(nn.View(1):setNumInputDims(3))
 
 netD:apply(weights_init)
 
--- local vgg = loadcaffe.load('model/VGG_ILSVRC_19_layers_deploy.prototxt', 'model/VGG_ILSVRC_19_layers.caffemodel', 'cudnn')
-
--- -- for i = 1, 9 do
--- --   vgg:remove()
--- -- end
--- vgg:remove(39)
--- vgg:insert(nn.Linear(2048, 4096), 39)
--- vgg:remove()
--- vgg:remove()
--- vgg:add(nn.Linear(4096, 1))
--- vgg:add(nn.Sigmoid())
--- vgg:add(nn.Squeeze())
-
--- test = torch.randn(2, 3, 64, 64)
-
--- vgg = vgg:cuda()
--- print(vgg:forward(test:cuda()):size())
-
-
--- netD = vgg
-
--- print(netD)
 
 local criterion = nn.BCECriterion()
 ---------------------------------------------------------------------------
 optimStateG = {
+   learningRate = opt.lr,
+   beta1 = opt.beta1,
+}
+optimStateD_feature = {
    learningRate = opt.lr,
    beta1 = opt.beta1,
 }
@@ -166,10 +182,13 @@ if opt.gpu > 0 then
    require 'cunn'
    cutorch.setDevice(opt.gpu)
    input = input:cuda();  noise = noise:cuda();  label = label:cuda()
-   netG = util.cudnn(netG);     netD = util.cudnn(netD)
-   netD:cuda();           netG:cuda();           criterion:cuda()
+   netG = util.cudnn(netG);     netD_feature = util.cudnn(netD_feature)
+   netD_feature:cuda();           netG:cuda();           criterion:cuda()
+   netD = util.cudnn(netD)
+   netD:cuda()
 end
 
+local parametersD_feature, gradParametersD_feature = netD_feature:getParameters()
 local parametersD, gradParametersD = netD:getParameters()
 local parametersG, gradParametersG = netG:getParameters()
 
@@ -182,9 +201,51 @@ elseif opt.noise == 'normal' then
     noise_vis:normal(0, 1)
 end
 
-local style_image = image.load('style_image.jpg', 3)
-local style_image = image.scale(style_image, 64, 64)
-local style_image_batch = torch.repeatTensor(style_image, opt.batchSize, 1, 1, 1)
+-- create closure to evaluate f(X) and df/dX of discriminator
+local fDx_feature = function(x)
+   netD_feature:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
+   netG:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
+
+   gradParametersD_feature:zero()
+
+   -- train with real
+   data_tm:reset(); data_tm:resume()
+   real = data:getBatch()
+   data_tm:stop()
+   input:copy(real)
+   input_feature = content_net:forward(input):clone()
+   input_feature = resize_image_batch(input_feature:float(), opt.fineSize, opt.fineSize)
+   input_feature = input_feature:cuda()
+   label:fill(real_label)
+
+   local output = netD_feature:forward(input_feature)
+   local errD_real = criterion:forward(output, label)
+   local df_do = criterion:backward(output, label)
+   netD_feature:backward(input_feature, df_do)
+
+   -- train with fake
+   if opt.noise == 'uniform' then -- regenerate random noise
+       noise:uniform(-1, 1)
+   elseif opt.noise == 'normal' then
+       noise:normal(0, 1)
+   end
+   fake = netG:forward(noise)
+   input:copy(fake)
+   input_feature = content_net:forward(input):clone()
+   input_feature = resize_image_batch(input_feature:float(), opt.fineSize, opt.fineSize)
+   input_feature = input_feature:cuda()
+
+   label:fill(fake_label)
+
+   local output = netD_feature:forward(input_feature)
+   local errD_fake = criterion:forward(output, label)
+   local df_do = criterion:backward(output, label)
+   netD_feature:backward(input_feature, df_do)
+
+   errD_feature = errD_real + errD_fake
+   return errD_feature, gradParametersD_feature
+end
+
 
 -- create closure to evaluate f(X) and df/dX of discriminator
 local fDx = function(x)
@@ -194,39 +255,43 @@ local fDx = function(x)
    gradParametersD:zero()
 
    -- train with real
-   data_tm:reset(); data_tm:resume()
-   -- local real = data:getBatch()
-   real = style_image_batch
-   data_tm:stop()
-   input:copy(real)
+   input:copy(real)  -- real come from fDx_feature
    label:fill(real_label)
-
 
    local output = netD:forward(input)
    local errD_real = criterion:forward(output, label)
    local df_do = criterion:backward(output, label)
    netD:backward(input, df_do)
 
-   -- train with fake
-   if opt.noise == 'uniform' then -- regenerate random noise
-       noise:uniform(-1, 1)
-   elseif opt.noise == 'normal' then
-       noise:normal(0, 1)
-   end
-   local fake = netG:forward(noise)
-   input:copy(fake)
+   input:copy(fake)  -- fake come from fDx_feature
    label:fill(fake_label)
-
-
 
    local output = netD:forward(input)
    local errD_fake = criterion:forward(output, label)
    local df_do = criterion:backward(output, label)
    netD:backward(input, df_do)
-
    errD = errD_real + errD_fake
-
    return errD, gradParametersD
+end
+
+
+-- create closure to evaluate f(X) and df/dX of generator
+local fGx_feature = function(x)
+   netD_feature:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
+   netG:apply(function(m) if torch.type(m):find('Convolution') then m.bias:zero() end end)
+
+   gradParametersG:zero()
+
+   label:fill(real_label) -- fake labels are real for generator cost
+
+   local output = netD_feature.output -- netD_feature:forward(input) was already executed in fDx_feature, so save computation
+   errG_feature = criterion:forward(output, label)
+   local df_do = criterion:backward(output, label)
+   local df_dg_feature = netD_feature:updateGradInput(input_feature, df_do)
+   local df_dg = content_net:updateGradInput(input, df_dg_feature)
+
+   netG:backward(noise, df_dg)
+   return errG_feature, gradParametersG
 end
 
 -- create closure to evaluate f(X) and df/dX of generator
@@ -236,10 +301,6 @@ local fGx = function(x)
 
    gradParametersG:zero()
 
-   --[[ the three lines below were already executed in fDx, so save computation
-   noise:uniform(-1, 1) -- regenerate random noise
-   local fake = netG:forward(noise)
-   input:copy(fake) ]]--
    label:fill(real_label) -- fake labels are real for generator cost
 
    local output = netD.output -- netD:forward(input) was already executed in fDx, so save computation
@@ -257,35 +318,43 @@ for epoch = 1, opt.niter do
    local counter = 0
    for i = 1, math.min(data:size(), opt.ntrain), opt.batchSize do
       tm:reset()
-      -- (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-      optim.adam(fDx, parametersD, optimStateD)
+      -- (1) Update D network for feature: maximize log(D(x)) + log(1 - D(G(z)))
+      optim.adam(fDx_feature, parametersD_feature, optimStateD_feature)
+      -- (1, b) update D network for image
 
+      optim.adam(fDx, parametersD, optimStateD)
       -- (2) Update G network: maximize log(D(G(z)))
+      optim.adam(fGx_feature, parametersG, optimStateG)
+      -- (2, b) update G network for image
       optim.adam(fGx, parametersG, optimStateG)
+
 
       -- display
       counter = counter + 1
       if counter % 10 == 0 and opt.display then
           local fake = netG:forward(noise_vis)
+          local real = data:getBatch()
           disp.image(fake, {win=opt.display_id, title=opt.name})
           disp.image(real, {win=opt.display_id * 3, title=opt.name})
       end
 
       -- logging
       if ((i-1) / opt.batchSize) % 1 == 0 then
-         print(('Epoch: [%d][%8d / %8d]\t Time: %.3f  DataTime: %.3f  '
-                   .. '  Err_G: %.4f  Err_D: %.4f'):format(
+         print(('Epoch: [%d][%d / %d]\t Time: %.2f  DataTime: %.2f '
+                   .. ' Err_G_feat: %.4f  Err_D_feat: %.4f  Err_G: %.4f  Err_D: %.4f'):format(
                  epoch, ((i-1) / opt.batchSize),
                  math.floor(math.min(data:size(), opt.ntrain) / opt.batchSize),
                  tm:time().real, data_tm:time().real,
-                 errG and errG or -1, errD and errD or -1))
+                 errG_feature or -1, errD_feature or -1, errG or -1, errD or -1))
       end
    end
    paths.mkdir('checkpoints')
+   parametersD_feature, gradParametersD_feature = nil, nil -- nil them to avoid spiking memory
    parametersD, gradParametersD = nil, nil -- nil them to avoid spiking memory
    parametersG, gradParametersG = nil, nil
    util.save('checkpoints/' .. opt.name .. '_' .. epoch .. '_net_G.t7', netG, opt.gpu)
-   util.save('checkpoints/' .. opt.name .. '_' .. epoch .. '_net_D.t7', netD, opt.gpu)
+   util.save('checkpoints/' .. opt.name .. '_' .. epoch .. '_net_D.t7', netD_feature, opt.gpu)
+   parametersD_feature, gradParametersD_feature = netD_feature:getParameters() -- reflatten the params and get them
    parametersD, gradParametersD = netD:getParameters() -- reflatten the params and get them
    parametersG, gradParametersG = netG:getParameters()
    print(('End of epoch %d / %d \t Time Taken: %.3f'):format(
